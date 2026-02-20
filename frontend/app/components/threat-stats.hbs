@@ -1,0 +1,28 @@
+<div class="threat-stats">
+  <p class="threat-stats-title">Threat Statistics</p>
+
+  <div class="threat-stats-card threat-stats-card--cyan">
+    <p class="threat-stats-card-label">Total Tracked</p>
+    <p class="threat-stats-card-value">{{this.stats.totalThreatsTracked}}</p>
+  </div>
+
+  <div class="threat-stats-card threat-stats-card--red">
+    <p class="threat-stats-card-label">High Risk</p>
+    <p class="threat-stats-card-value">{{this.stats.highRiskThreats}}</p>
+  </div>
+
+  <div class="threat-stats-card threat-stats-card--yellow">
+    <p class="threat-stats-card-label">Medium Risk</p>
+    <p class="threat-stats-card-value">{{this.stats.mediumRiskThreats}}</p>
+  </div>
+
+  <div class="threat-stats-card threat-stats-card--green">
+    <p class="threat-stats-card-label">Low Risk</p>
+    <p class="threat-stats-card-value">{{this.stats.lowRiskThreats}}</p>
+  </div>
+
+  <div class="threat-stats-card threat-stats-card--purple">
+    <p class="threat-stats-card-label">Countries</p>
+    <p class="threat-stats-card-value">{{this.stats.countriesAffected}}</p>
+  </div>
+</div>

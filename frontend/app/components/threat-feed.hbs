@@ -1,0 +1,35 @@
+<div class="threat-feed">
+  <h3 class="threat-feed-title">Recent Malicious IPs</h3>
+
+  {{#if this.threats.length}}
+    <div class="threat-feed-list">
+      {{#each this.threats as |threat|}}
+        <div class="threat-feed-item">
+          <div>
+            <div style="display: flex; align-items: center; gap: 12px;">
+              <button
+                type="button"
+                {{on "click" (fn this.copyIpAddress threat.ipAddress)}}
+                class="threat-feed-ip"
+                title="Click to copy"
+                aria-label="Copy IP address {{threat.ipAddress}}"
+              >
+                {{threat.ipAddress}}
+              </button>
+              <span class={{this.getThreatBadgeClass threat.abuseScore}}>
+                {{threat.abuseScore}}%
+              </span>
+            </div>
+            <div class="threat-feed-meta">
+              <span>{{threat.countryCode}}</span>
+              <span>{{threat.totalReports}} reports</span>
+            </div>
+          </div>
+          <div class="threat-feed-timestamp">{{threat.lastReportedAt}}</div>
+        </div>
+      {{/each}}
+    </div>
+  {{else}}
+    <p class="threat-feed-empty">No threats yet. Look up an IP to populate the feed.</p>
+  {{/if}}
+</div>

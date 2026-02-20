@@ -1,0 +1,125 @@
+<div class="ip-lookup">
+  <h2 class="ip-lookup-title">IP Threat Intelligence Lookup</h2>
+
+  <form {{on "submit" this.lookupIp}} class="ip-lookup-form">
+    <div class="ip-lookup-input-wrapper">
+      <label for="ip-input" class="ip-lookup-label">Enter IP Address</label>
+      <input
+        id="ip-input"
+        type="text"
+        value={{this.ipAddress}}
+        {{on "input" this.updateIpAddress}}
+        placeholder="e.g., 118.25.6.39"
+        class="ip-lookup-input"
+        disabled={{this.isLoading}}
+        aria-label="IP Address Input"
+      />
+    </div>
+    <button
+      type="submit"
+      class="ip-lookup-button"
+      disabled={{this.isLoading}}
+      aria-label="Lookup IP Address"
+    >
+      {{#if this.isLoading}}
+        <span class="spinner"></span> Analyzing...
+      {{else}}
+        Lookup IP
+      {{/if}}
+    </button>
+  </form>
+
+  {{#if this.error}}
+    <div class="ip-lookup-error" role="alert">
+      <strong>Error:</strong> {{this.error}}
+    </div>
+  {{/if}}
+
+  {{#if this.threatData}}
+    <div class="ip-lookup-results">
+      <div class="ip-lookup-results-header">
+        <span class="ip-lookup-results-title">{{this.threatData.ipAddress}}</span>
+        <button type="button" class="ip-lookup-clear" {{on "click" this.clearResults}}>
+          Clear
+        </button>
+      </div>
+
+      <div class="ip-lookup-stats">
+        <div class="ip-lookup-stat">
+          <p class="ip-lookup-stat-label">Abuse Score</p>
+          <p class="ip-lookup-stat-value">{{this.threatData.abuseScore}}%</p>
+          <span class={{this.threatBadgeClass}}>{{this.threatLevelText}}</span>
+        </div>
+        <div class="ip-lookup-stat">
+          <p class="ip-lookup-stat-label">Total Reports</p>
+          <p class="ip-lookup-stat-value">{{this.threatData.totalReports}}</p>
+        </div>
+        <div class="ip-lookup-stat">
+          <p class="ip-lookup-stat-label">Country</p>
+          <p class="ip-lookup-stat-value" style="font-size: 1.2rem;">{{this.threatData.countryCode}}</p>
+          <p style="font-size: 0.75rem; color: #6b7280;">{{this.threatData.location.country}}</p>
+        </div>
+        <div class="ip-lookup-stat">
+          <p class="ip-lookup-stat-label">Whitelisted</p>
+          <p class="ip-lookup-stat-value" style="color: {{if this.threatData.isWhitelisted '#10b981' '#ef4444'}}; font-size: 1.2rem;">
+            {{if this.threatData.isWhitelisted "Yes" "No"}}
+          </p>
+        </div>
+      </div>
+
+      <div class="ip-lookup-details">
+        <div>
+          <p class="ip-lookup-detail-title">Network Information</p>
+          <div class="ip-lookup-detail-row">
+            <span class="ip-lookup-detail-key">ISP</span>
+            <span class="ip-lookup-detail-value">{{this.threatData.isp}}</span>
+          </div>
+          <div class="ip-lookup-detail-row">
+            <span class="ip-lookup-detail-key">Usage Type</span>
+            <span class="ip-lookup-detail-value">{{this.threatData.usageType}}</span>
+          </div>
+          {{#if this.threatData.domain}}
+            <div class="ip-lookup-detail-row">
+              <span class="ip-lookup-detail-key">Domain</span>
+              <span class="ip-lookup-detail-value">{{this.threatData.domain}}</span>
+            </div>
+          {{/if}}
+          {{#if this.threatData.location.city}}
+            <div class="ip-lookup-detail-row">
+              <span class="ip-lookup-detail-key">City</span>
+              <span class="ip-lookup-detail-value">{{this.threatData.location.city}}</span>
+            </div>
+          {{/if}}
+        </div>
+        <div>
+          <p class="ip-lookup-detail-title">Timeline</p>
+          {{#if this.threatData.lastReportedAt}}
+            <div class="ip-lookup-detail-row">
+              <span class="ip-lookup-detail-key">Last Reported</span>
+              <span class="ip-lookup-detail-value">{{this.threatData.lastReportedAt}}</span>
+            </div>
+          {{/if}}
+        </div>
+      </div>
+
+      {{#if this.threatData.reports}}
+        <div class="ip-lookup-reports">
+          <p class="ip-lookup-reports-title">Recent Abuse Reports</p>
+          <div class="ip-lookup-report-list">
+            {{#each this.threatData.reports as |report|}}
+              <div class="ip-lookup-report-item">
+                <div class="ip-lookup-report-meta">
+                  <span class="ip-lookup-report-date">{{report.reportedAt}}</span>
+                  {{#if report.reporterCountryCode}}
+                    <span class="ip-lookup-report-country">{{report.reporterCountryCode}}</span>
+                  {{/if}}
+                </div>
+                <p class="ip-lookup-report-comment">{{report.comment}}</p>
+              </div>
+            {{/each}}
+          </div>
+        </div>
+      {{/if}}
+    </div>
+  {{/if}}
+</div>

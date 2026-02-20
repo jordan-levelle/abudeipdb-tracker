@@ -1,0 +1,27 @@
+<div class="dashboard-wrapper">
+  <header class="dashboard-header">
+    <p class="dashboard-header-eyebrow">Live Intelligence Feed</p>
+    <h1 class="dashboard-header-title">
+      AbuseIPDB <span>Threat Tracker</span>
+    </h1>
+    <p class="dashboard-header-subtitle">
+      Real-time cybersecurity threat intelligence powered by GraphQL
+    </p>
+  </header>
+
+  {{#if @model.error}}
+    <div class="dashboard-error" role="alert">
+      <p class="dashboard-error-title">Error Loading Dashboard</p>
+      <p>{{@model.error}}</p>
+    </div>
+  {{/if}}
+  <div class="dashboard-lookup">
+    <IpLookup />
+  </div>
+  <div class="dashboard-grid">
+    <div><ThreatStats @stats={{@model.stats}} /></div>
+    <div><ThreatFeed @threats={{@model.threats}} /></div>
+  </div>
+
+
+</div>
