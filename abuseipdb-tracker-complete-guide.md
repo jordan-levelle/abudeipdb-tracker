@@ -1,7 +1,7 @@
 # AbuseIPDB Threat Tracker - Complete Build Guide
 ## Ember.js + GraphQL Cybersecurity Dashboard
 
-> **Purpose:** Build a production-ready cybersecurity threat monitoring application using Ember.js and GraphQL to showcase skills relevant to CrowdStrike UI Engineer role.
+> **Purpose:** Build a production-ready cybersecurity threat monitoring application using Ember.js and GraphQL, integrating AbuseIPDB for real IP threat intelligence.
 
 ---
 
@@ -12,8 +12,7 @@
 4. [Frontend Setup (Ember.js)](#frontend-setup)
 5. [Complete File Structure](#complete-file-structure)
 6. [Deployment Guide](#deployment-guide)
-7. [Testing Guide](#testing-guide)
-8. [Resume Bullets](#resume-bullets)
+7. [Resume Bullets](#resume-bullets)
 
 ---
 
@@ -21,8 +20,8 @@
 
 ### Required Software
 ```bash
-# Node.js (v18 or higher)
-node --version  # Should be v18+
+# Node.js (v20 or higher)
+node --version  # Should be v20+
 
 # npm (comes with Node.js)
 npm --version
@@ -35,7 +34,7 @@ git --version
 ```
 
 ### API Keys Required
-1. **AbuseIPDB API Key** (Free tier: 1,000 requests/day)
+1. **AbuseIPDB API Key** (Free tier: 1,000 checks/day note: blacklist endpoint limited to 5/day on free tier)
    - Sign up: https://www.abuseipdb.com/account
    - Navigate to: Account → API → Create Key
 
@@ -46,23 +45,31 @@ git --version
 ### Tech Stack
 **Backend:**
 - Node.js + Express
-- Apollo Server (GraphQL)
+- Apollo Server v4 (GraphQL)
 - AbuseIPDB API integration
+- ip-api.com for geolocation (free, no key required)
 - Axios for HTTP requests
+- In-memory caching
 
 **Frontend:**
-- Ember.js 5.x
-- ember-apollo-client
-- Tailwind CSS
-- Chart.js for visualizations
+- Ember.js 6.x (Octane edition)
+- Embroider + Vite build pipeline
+- @apollo/client (direct, no ember-apollo-client wrapper)
+- Tailwind CSS v4 with PostCSS
+- Pure CSS for component styling
 
 ### Features
 - Real-time IP threat intelligence lookup
-- Recent malicious IP feed
-- Threat severity visualization
-- Geographic threat mapping
+- Recent malicious IP feed (populated by user lookups)
+- Threat severity stats
 - Abuse confidence scoring
-- Responsive, accessible UI
+- Responsive dark cybersecurity UI
+
+### Important Notes on Free Tier Limitations
+- AbuseIPDB `/check` endpoint: 1,000/day (used for IP lookups — fine)
+- AbuseIPDB `/blacklist` endpoint: only 5/day (too limited for dashboard use)
+- **Solution:** `recentThreats` and `threatStats` are populated from an in-memory store of looked-up IPs, not the blacklist endpoint
+- Geolocation via ip-api.com: 45 requests/minute, no daily limit
 
 ---
 
@@ -81,7 +88,7 @@ npm init -y
 ### Step 2: Install Backend Dependencies
 
 ```bash
-npm install express apollo-server-express graphql axios cors dotenv
+npm install express @apollo/server @apollo/server/express4 graphql axios cors dotenv
 npm install --save-dev nodemon
 ```
 
@@ -101,7 +108,7 @@ npm install --save-dev nodemon
   "author": "Your Name",
   "license": "MIT",
   "dependencies": {
-    "apollo-server-express": "^3.13.0",
+    "@apollo/server": "^4.0.0",
     "axios": "^1.6.0",
     "cors": "^2.8.5",
     "dotenv": "^16.3.1",
@@ -126,13 +133,37 @@ NODE_ENV=development
 
 ```javascript
 const express = require('express');
-const { ApolloServer, gql } = require('apollo-server-express');
+const { ApolloServer } = require('@apollo/server');
+const { expressMiddleware } = require('@apollo/server/express4');
 const axios = require('axios');
 const cors = require('cors');
 require('dotenv').config();
 
+// Simple in-memory cache
+const cache = {
+  data: {},
+  set(key, value, ttlMinutes = 10) {
+    this.data[key] = {
+      value,
+      expires: Date.now() + ttlMinutes * 60 * 1000
+    };
+  },
+  get(key) {
+    const entry = this.data[key];
+    if (!entry) return null;
+    if (Date.now() > entry.expires) {
+      delete this.data[key];
+      return null;
+    }
+    return entry.value;
+  }
+};
+
+// In-memory store of recently checked IPs (populated by lookups)
+const recentlyChecked = [];
+
 // GraphQL Type Definitions
-const typeDefs = gql`
+const typeDefs = `#graphql
   type Location {
     country: String!
     city: String
@@ -190,18 +221,16 @@ const resolvers = {
   Query: {
     threatIntelligence: async (_, { ipAddress }) => {
       try {
-        // Validate IP address format
         const ipRegex = /^(\d{1,3}\.){3}\d{1,3}$/;
         if (!ipRegex.test(ipAddress)) {
           throw new Error('Invalid IP address format');
         }
 
-        // Fetch from AbuseIPDB
         const abuseResponse = await axios.get(
           `https://api.abuseipdb.com/api/v2/check`,
           {
-            params: { 
-              ipAddress, 
+            params: {
+              ipAddress,
               maxAgeInDays: 90,
               verbose: true
             },
@@ -214,19 +243,16 @@ const resolvers = {
 
         const data = abuseResponse.data.data;
 
-        // Fetch geolocation data
+        // Geolocation via ip-api.com (free, no key, 45 req/min)
         let location = null;
         try {
-          const geoResponse = await axios.get(
-            `https://ipapi.co/${ipAddress}/json/`
-          );
-          
-          if (geoResponse.data && !geoResponse.data.error) {
+          const geoResponse = await axios.get(`http://ip-api.com/json/${ipAddress}`);
+          if (geoResponse.data && geoResponse.data.status === 'success') {
             location = {
-              country: geoResponse.data.country_name || 'Unknown',
+              country: geoResponse.data.country || 'Unknown',
               city: geoResponse.data.city || null,
-              lat: geoResponse.data.latitude || null,
-              lng: geoResponse.data.longitude || null
+              lat: geoResponse.data.lat || null,
+              lng: geoResponse.data.lon || null
             };
           }
         } catch (geoError) {
@@ -239,7 +265,6 @@ const resolvers = {
           };
         }
 
-        // Parse reports
         const reports = data.reports ? data.reports.slice(0, 10).map(report => ({
           reportedAt: report.reportedAt,
           comment: report.comment || 'No comment provided',
@@ -248,7 +273,7 @@ const resolvers = {
           reporterCountryCode: report.reporterCountryCode || null
         })) : [];
 
-        return {
+        const result = {
           ipAddress: data.ipAddress,
           abuseScore: data.abuseConfidenceScore,
           totalReports: data.totalReports,
@@ -261,128 +286,86 @@ const resolvers = {
           isp: data.isp || 'Unknown',
           reports
         };
+
+        // Add to recently checked feed
+        recentlyChecked.unshift({
+          ipAddress: result.ipAddress,
+          abuseScore: result.abuseScore,
+          totalReports: result.totalReports,
+          countryCode: result.countryCode,
+          lastReportedAt: result.lastReportedAt || new Date().toISOString()
+        });
+        if (recentlyChecked.length > 50) recentlyChecked.pop();
+
+        return result;
       } catch (error) {
         if (error.response) {
-          throw new Error(`AbuseIPDB API Error: ${error.response.data.errors[0].detail}`);
+          throw new Error(`AbuseIPDB API Error: ${error.response.data.errors?.[0]?.detail || error.response.statusText}`);
         }
         throw new Error(`Failed to fetch threat data: ${error.message}`);
       }
     },
 
+    // Populated from recentlyChecked — no blacklist API call needed
     recentThreats: async (_, { limit = 20, minScore = 0 }) => {
-      try {
-        const response = await axios.get(
-          `https://api.abuseipdb.com/api/v2/blacklist`,
-          {
-            params: { 
-              confidenceMinimum: minScore,
-              limit: Math.min(limit, 100) // Cap at 100
-            },
-            headers: {
-              'Key': process.env.ABUSEIPDB_API_KEY,
-              'Accept': 'application/json'
-            }
-          }
-        );
-
-        return response.data.data.map(item => ({
-          ipAddress: item.ipAddress,
-          abuseScore: item.abuseConfidenceScore,
-          totalReports: item.totalReports || 0,
-          countryCode: item.countryCode || 'Unknown',
-          lastReportedAt: item.lastReportedAt
-        }));
-      } catch (error) {
-        if (error.response) {
-          throw new Error(`AbuseIPDB API Error: ${error.response.statusText}`);
-        }
-        throw new Error(`Failed to fetch recent threats: ${error.message}`);
-      }
+      return recentlyChecked
+        .filter(t => t.abuseScore >= minScore)
+        .slice(0, limit);
     },
 
+    // Calculated from recentlyChecked — no blacklist API call needed
     threatStats: async () => {
-      try {
-        // Fetch recent threats with different confidence levels
-        const [highRisk, mediumRisk, lowRisk] = await Promise.all([
-          axios.get('https://api.abuseipdb.com/api/v2/blacklist', {
-            params: { confidenceMinimum: 90, limit: 100 },
-            headers: {
-              'Key': process.env.ABUSEIPDB_API_KEY,
-              'Accept': 'application/json'
-            }
-          }),
-          axios.get('https://api.abuseipdb.com/api/v2/blacklist', {
-            params: { confidenceMinimum: 50, limit: 100 },
-            headers: {
-              'Key': process.env.ABUSEIPDB_API_KEY,
-              'Accept': 'application/json'
-            }
-          }),
-          axios.get('https://api.abuseipdb.com/api/v2/blacklist', {
-            params: { confidenceMinimum: 25, limit: 100 },
-            headers: {
-              'Key': process.env.ABUSEIPDB_API_KEY,
-              'Accept': 'application/json'
-            }
-          })
-        ]);
+      const high = recentlyChecked.filter(t => t.abuseScore >= 90).length;
+      const medium = recentlyChecked.filter(t => t.abuseScore >= 50 && t.abuseScore < 90).length;
+      const low = recentlyChecked.filter(t => t.abuseScore < 50).length;
+      const uniqueCountries = new Set(recentlyChecked.map(t => t.countryCode).filter(Boolean));
 
-        const allThreats = mediumRisk.data.data;
-        const uniqueCountries = new Set(allThreats.map(t => t.countryCode).filter(Boolean));
-
-        return {
-          totalThreatsTracked: allThreats.length,
-          highRiskThreats: highRisk.data.data.length,
-          mediumRiskThreats: mediumRisk.data.data.length - highRisk.data.data.length,
-          lowRiskThreats: lowRisk.data.data.length - mediumRisk.data.data.length,
-          countriesAffected: uniqueCountries.size
-        };
-      } catch (error) {
-        console.error('Error fetching threat stats:', error.message);
-        // Return default values if API fails
-        return {
-          totalThreatsTracked: 0,
-          highRiskThreats: 0,
-          mediumRiskThreats: 0,
-          lowRiskThreats: 0,
-          countriesAffected: 0
-        };
-      }
+      return {
+        totalThreatsTracked: recentlyChecked.length,
+        highRiskThreats: high,
+        mediumRiskThreats: medium,
+        lowRiskThreats: low,
+        countriesAffected: uniqueCountries.size
+      };
     }
   }
 };
 
-// Start Apollo Server
 async function startServer() {
   const app = express();
-  
-  // Enable CORS for local development
-  app.use(cors({
-    origin: process.env.NODE_ENV === 'production' 
-      ? ['https://your-ember-app.netlify.app']
-      : ['http://localhost:4200', 'http://localhost:7020'],
-    credentials: true
-  }));
 
-  // Health check endpoint
-  app.get('/health', (req, res) => {
-    res.json({ status: 'ok', message: 'AbuseIPDB GraphQL API is running' });
-  });
-
-  const server = new ApolloServer({ 
-    typeDefs, 
+  const server = new ApolloServer({
+    typeDefs,
     resolvers,
-    introspection: true, // Enable for GraphQL Playground
-    playground: true
   });
 
   await server.start();
-  server.applyMiddleware({ app, path: '/graphql' });
+
+  app.use(
+    '/graphql',
+    cors({
+      origin: [
+        'http://localhost:4200',
+        'https://your-netlify-app.netlify.app' // update after deploying frontend
+      ],
+      credentials: true
+    }),
+    express.json(),
+    expressMiddleware(server)
+  );
+
+  app.get('/health', (req, res) => {
+    res.json({
+      status: 'ok',
+      message: 'AbuseIPDB GraphQL API is running',
+      timestamp: new Date().toISOString()
+    });
+  });
 
   const PORT = process.env.PORT || 4000;
   app.listen(PORT, () => {
-    console.log(`🚀 Server ready at http://localhost:${PORT}${server.graphqlPath}`);
-    console.log(`📊 GraphQL Playground: http://localhost:${PORT}${server.graphqlPath}`);
+    console.log(`🚀 Server ready at http://localhost:${PORT}/graphql`);
+    console.log(`📊 Health check at http://localhost:${PORT}/health`);
   });
 }
 
@@ -399,34 +382,13 @@ node_modules/
 .env
 .DS_Store
 npm-debug.log
-.vscode/
 ```
 
 ### Step 7: Test Backend
 
 ```bash
-# Start the server
 npm run dev
-
-# Server should be running at http://localhost:4000/graphql
-# Open browser and test queries in GraphQL Playground
-```
-
-**Test Query in Playground:**
-```graphql
-query TestQuery {
-  threatIntelligence(ipAddress: "118.25.6.39") {
-    ipAddress
-    abuseScore
-    totalReports
-    countryCode
-    usageType
-    location {
-      country
-      city
-    }
-  }
-}
+# Server running at http://localhost:4000/graphql
 ```
 
 ---
@@ -436,10 +398,7 @@ query TestQuery {
 ### Step 1: Create Ember Application
 
 ```bash
-# Navigate back to root project directory
 cd ..
-
-# Create Ember app
 npx ember-cli new frontend --skip-git
 cd frontend
 ```
@@ -447,49 +406,21 @@ cd frontend
 ### Step 2: Install Frontend Dependencies
 
 ```bash
-# Install ember-apollo-client
-ember install ember-apollo-client
+# Apollo Client (direct — do NOT use ember-apollo-client, incompatible with Ember 6)
+npm install @apollo/client graphql --save-dev
 
-# Install Tailwind CSS
-npm install -D tailwindcss@latest postcss@latest autoprefixer@latest
-npm install -D ember-cli-postcss
+# Tailwind CSS v4
+npm install tailwindcss@4 @tailwindcss/postcss --save-dev
 
-# Initialize Tailwind
-npx tailwindcss init
-
-# Install Chart.js for visualizations
-npm install chart.js ember-cli-chart
-
-# Install additional dependencies
-npm install graphql-tag
+# Chart.js (optional, for future visualizations)
+npm install chart.js
 ```
 
-### Step 3: Create `frontend/tailwind.config.js`
+> **Important:** Do NOT install `ember-apollo-client` or `ember-cli-postcss`. These are incompatible with Ember 6 + Embroider + Vite.
 
-```javascript
-/** @type {import('tailwindcss').Config} */
-module.exports = {
-  content: [
-    './app/**/*.{js,ts,hbs}',
-    './tests/**/*.{js,ts,hbs}'
-  ],
-  theme: {
-    extend: {
-      colors: {
-        'threat-high': '#dc2626',
-        'threat-medium': '#f59e0b',
-        'threat-low': '#10b981',
-        'primary': '#3b82f6',
-        'dark-bg': '#1e293b',
-        'dark-card': '#334155'
-      }
-    },
-  },
-  plugins: [],
-}
-```
+### Step 3: Create `frontend/ember-cli-build.js`
 
-### Step 4: Update `frontend/ember-cli-build.js`
+Required by Ember CLI even with the Vite build pipeline:
 
 ```javascript
 'use strict';
@@ -497,116 +428,639 @@ module.exports = {
 const EmberApp = require('ember-cli/lib/broccoli/ember-app');
 
 module.exports = function (defaults) {
-  const app = new EmberApp(defaults, {
-    // Add PostCSS options
-    postcssOptions: {
-      compile: {
-        plugins: [
-          require('tailwindcss'),
-          require('autoprefixer')
-        ]
-      }
-    }
-  });
-
-  return app.toTree();
+  const app = new EmberApp(defaults, {});
+  return require('@embroider/compat').compatBuild(app);
 };
 ```
 
-### Step 5: Create `frontend/app/styles/app.css`
+### Step 4: Update `frontend/vite.config.mjs`
+
+```javascript
+import { defineConfig } from 'vite';
+import { extensions, classicEmberSupport, ember } from '@embroider/vite';
+import { babel } from '@rollup/plugin-babel';
+
+export default defineConfig({
+  plugins: [
+    classicEmberSupport(),
+    ember(),
+    babel({
+      babelHelpers: 'runtime',
+      extensions,
+    }),
+  ],
+});
+```
+
+### Step 5: Create `frontend/postcss.config.mjs`
+
+```javascript
+export default {
+  plugins: {
+    '@tailwindcss/postcss': {},
+  },
+};
+```
+
+### Step 6: Update `frontend/app/styles/app.css`
 
 ```css
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
 
-/* Custom styles */
+@source "./app/**/*.{js,ts,hbs}";
+
 body {
-  @apply bg-gray-50 text-gray-900;
-}
-
-.dark body {
-  @apply bg-dark-bg text-gray-100;
-}
-
-/* Card styles */
-.card {
-  @apply bg-white rounded-lg shadow-md p-6 transition-shadow hover:shadow-lg;
-}
-
-.dark .card {
-  @apply bg-dark-card;
+  background-color: #030712;
+  color: #f1f5f9;
 }
 
 /* Threat score badge */
 .threat-badge {
-  @apply inline-flex items-center px-3 py-1 rounded-full text-sm font-semibold;
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 0.75rem;
+  font-weight: 700;
+  font-family: monospace;
 }
 
 .threat-high {
-  @apply bg-red-100 text-red-800;
+  background-color: rgba(239, 68, 68, 0.2);
+  color: #f87171;
+  border: 1px solid rgba(239, 68, 68, 0.3);
 }
 
 .threat-medium {
-  @apply bg-yellow-100 text-yellow-800;
+  background-color: rgba(245, 158, 11, 0.2);
+  color: #fbbf24;
+  border: 1px solid rgba(245, 158, 11, 0.3);
 }
 
 .threat-low {
-  @apply bg-green-100 text-green-800;
-}
-
-.dark .threat-high {
-  @apply bg-red-900 text-red-200;
-}
-
-.dark .threat-medium {
-  @apply bg-yellow-900 text-yellow-200;
-}
-
-.dark .threat-low {
-  @apply bg-green-900 text-green-200;
-}
-
-/* Input styles */
-.input {
-  @apply w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary focus:border-transparent;
-}
-
-.dark .input {
-  @apply bg-dark-card border-gray-600 text-white;
-}
-
-/* Button styles */
-.btn {
-  @apply px-6 py-2 rounded-lg font-semibold transition-colors focus:outline-none focus:ring-2 focus:ring-offset-2;
-}
-
-.btn-primary {
-  @apply bg-primary text-white hover:bg-blue-600 focus:ring-primary;
-}
-
-.btn-primary:disabled {
-  @apply bg-gray-400 cursor-not-allowed;
+  background-color: rgba(16, 185, 129, 0.2);
+  color: #34d399;
+  border: 1px solid rgba(16, 185, 129, 0.3);
 }
 
 /* Loading spinner */
 .spinner {
-  @apply inline-block w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin;
+  display: inline-block;
+  width: 20px;
+  height: 20px;
+  border: 2px solid #06b6d4;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
 }
 
-/* Threat feed item */
-.threat-item {
-  @apply flex items-center justify-between p-4 border-b border-gray-200 hover:bg-gray-50 transition-colors;
+@keyframes spin {
+  to { transform: rotate(360deg); }
 }
 
-.dark .threat-item {
-  @apply border-gray-700 hover:bg-gray-800;
+/* Application Layout */
+.app-wrapper {
+  min-height: 100vh;
+  background-color: #030712;
+  color: #f1f5f9;
+  display: flex;
+  flex-direction: column;
+}
+
+.app-nav {
+  background-color: #111827;
+  border-bottom: 1px solid rgba(6, 182, 212, 0.3);
+  box-shadow: 0 4px 24px rgba(6, 182, 212, 0.05);
+  margin-bottom: 32px;
+}
+
+.app-nav-inner {
+  max-width: 1280px;
+  margin: 0 auto;
+  padding: 16px 24px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.app-nav-brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.app-nav-icon {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background-color: rgba(6, 182, 212, 0.15);
+  border: 1px solid rgba(6, 182, 212, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.75rem;
+  font-weight: 700;
+  color: #06b6d4;
+}
+
+.app-nav-title {
+  font-size: 1.1rem;
+  font-weight: 700;
+  color: #06b6d4;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+}
+
+.app-nav-subtitle {
+  font-size: 0.7rem;
+  color: #4b5563;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+}
+
+.app-main {
+  width: 100%;
+  max-width: 1280px;
+  margin: 0 auto;
+  padding: 0 24px;
+  flex: 1;
+  box-sizing: border-box;
+}
+
+.app-footer {
+  margin-top: 64px;
+  padding: 32px 24px;
+  border-top: 1px solid #1f2937;
+}
+
+.app-footer-inner {
+  max-width: 1280px;
+  margin: 0 auto;
+  text-align: center;
+  font-size: 0.7rem;
+  color: #374151;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  line-height: 2;
+}
+
+/* Dashboard */
+.dashboard-wrapper {
+  padding: 16px 0;
+}
+
+.dashboard-header {
+  margin-bottom: 40px;
+}
+
+.dashboard-header-eyebrow {
+  font-size: 0.7rem;
+  font-weight: 600;
+  color: #06b6d4;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  margin-bottom: 8px;
+}
+
+.dashboard-header-title {
+  font-size: 2.5rem;
+  font-weight: 700;
+  color: #f1f5f9;
+  letter-spacing: -0.02em;
+  margin-bottom: 8px;
+  line-height: 1.1;
+}
+
+.dashboard-header-title span {
+  color: #06b6d4;
+}
+
+.dashboard-header-subtitle {
+  font-size: 0.85rem;
+  color: #4b5563;
+  letter-spacing: 0.05em;
+}
+
+.dashboard-error {
+  border: 1px solid rgba(239, 68, 68, 0.4);
+  background-color: rgba(239, 68, 68, 0.1);
+  color: #f87171;
+  padding: 16px 24px;
+  border-radius: 8px;
+  margin-bottom: 32px;
+  font-size: 0.85rem;
+}
+
+.dashboard-error-title {
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  margin-bottom: 4px;
+  font-size: 0.75rem;
+}
+
+.dashboard-grid {
+  display: flex;
+  flex-direction: row;
+  gap: 24px;
+  margin-bottom: 24px;
+}
+
+.dashboard-grid > div {
+  flex: 1;
+}
+
+.dashboard-lookup {
+  margin-bottom: 24px;
+}
+
+@media (max-width: 768px) {
+  .dashboard-grid {
+    flex-direction: column;
+  }
+  .dashboard-header-title {
+    font-size: 1.75rem;
+  }
+}
+
+/* Threat Stats Component */
+.threat-stats {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  height: 100%;
+}
+
+.threat-stats-title {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: #06b6d4;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  margin-bottom: 4px;
+}
+
+.threat-stats-card {
+  background-color: #111827;
+  border-radius: 8px;
+  padding: 16px;
+  transition: filter 0.2s;
+  flex: 1;
+}
+
+.threat-stats-card:hover {
+  filter: brightness(1.1);
+}
+
+.threat-stats-card-label {
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.15em;
+  margin-bottom: 8px;
+}
+
+.threat-stats-card-value {
+  font-family: monospace;
+  font-size: 2rem;
+  font-weight: 700;
+}
+
+.threat-stats-card--cyan { border: 1px solid rgba(6, 182, 212, 0.3); }
+.threat-stats-card--cyan .threat-stats-card-label { color: #06b6d4; }
+.threat-stats-card--cyan .threat-stats-card-value { color: #06b6d4; }
+
+.threat-stats-card--red { border: 1px solid rgba(239, 68, 68, 0.3); }
+.threat-stats-card--red .threat-stats-card-label { color: #f87171; }
+.threat-stats-card--red .threat-stats-card-value { color: #f87171; }
+
+.threat-stats-card--yellow { border: 1px solid rgba(245, 158, 11, 0.3); }
+.threat-stats-card--yellow .threat-stats-card-label { color: #fbbf24; }
+.threat-stats-card--yellow .threat-stats-card-value { color: #fbbf24; }
+
+.threat-stats-card--green { border: 1px solid rgba(16, 185, 129, 0.3); }
+.threat-stats-card--green .threat-stats-card-label { color: #34d399; }
+.threat-stats-card--green .threat-stats-card-value { color: #34d399; }
+
+.threat-stats-card--purple { border: 1px solid rgba(139, 92, 246, 0.3); }
+.threat-stats-card--purple .threat-stats-card-label { color: #a78bfa; }
+.threat-stats-card--purple .threat-stats-card-value { color: #a78bfa; }
+
+/* Threat Feed Component */
+.threat-feed {
+  background-color: #111827;
+  border: 1px solid rgba(6, 182, 212, 0.3);
+  border-radius: 8px;
+  padding: 24px;
+  height: 100%;
+  box-sizing: border-box;
+}
+
+.threat-feed-title {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: #06b6d4;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  margin-bottom: 16px;
+}
+
+.threat-feed-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.threat-feed-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 0;
+  border-bottom: 1px solid #1f2937;
+  transition: background-color 0.2s;
+}
+
+.threat-feed-item:last-child {
+  border-bottom: none;
+}
+
+.threat-feed-ip {
+  background: none;
+  border: none;
+  font-family: monospace;
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: #06b6d4;
+  cursor: pointer;
+  padding: 0;
+  transition: color 0.2s;
+}
+
+.threat-feed-ip:hover {
+  color: #22d3ee;
+}
+
+.threat-feed-meta {
+  display: flex;
+  gap: 16px;
+  margin-top: 4px;
+  font-size: 0.75rem;
+  color: #6b7280;
+}
+
+.threat-feed-timestamp {
+  font-size: 0.7rem;
+  color: #4b5563;
+  font-family: monospace;
+}
+
+.threat-feed-empty {
+  text-align: center;
+  padding: 40px 0;
+  font-size: 0.85rem;
+  color: #4b5563;
+  letter-spacing: 0.1em;
+}
+
+/* IP Lookup Component */
+.ip-lookup {
+  background-color: #111827;
+  border: 1px solid rgba(6, 182, 212, 0.3);
+  border-radius: 8px;
+  padding: 24px;
+}
+
+.ip-lookup-title {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: #06b6d4;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  margin-bottom: 20px;
+}
+
+.ip-lookup-form {
+  display: flex;
+  gap: 12px;
+  margin-bottom: 24px;
+}
+
+.ip-lookup-input-wrapper {
+  flex: 1;
+}
+
+.ip-lookup-label {
+  display: block;
+  font-size: 0.75rem;
+  color: #6b7280;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  margin-bottom: 8px;
+}
+
+.ip-lookup-input {
+  width: 100%;
+  padding: 10px 14px;
+  background-color: #1f2937;
+  border: 1px solid #374151;
+  border-radius: 6px;
+  color: #f1f5f9;
+  font-family: monospace;
+  font-size: 0.9rem;
+  transition: border-color 0.2s;
+  box-sizing: border-box;
+}
+
+.ip-lookup-input:focus {
+  outline: none;
+  border-color: #06b6d4;
+  box-shadow: 0 0 0 2px rgba(6, 182, 212, 0.2);
+}
+
+.ip-lookup-input::placeholder { color: #4b5563; }
+.ip-lookup-input:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.ip-lookup-button {
+  padding: 10px 20px;
+  background-color: #06b6d4;
+  color: #030712;
+  border: none;
+  border-radius: 6px;
+  font-weight: 700;
+  font-size: 0.85rem;
+  letter-spacing: 0.05em;
+  cursor: pointer;
+  transition: background-color 0.2s;
+  white-space: nowrap;
+  align-self: flex-end;
+}
+
+.ip-lookup-button:hover { background-color: #22d3ee; }
+.ip-lookup-button:disabled { background-color: #374151; color: #6b7280; cursor: not-allowed; }
+
+.ip-lookup-error {
+  border: 1px solid rgba(239, 68, 68, 0.4);
+  background-color: rgba(239, 68, 68, 0.1);
+  color: #f87171;
+  padding: 12px 16px;
+  border-radius: 6px;
+  margin-bottom: 20px;
+  font-size: 0.85rem;
+}
+
+.ip-lookup-results {
+  border-top: 1px solid #1f2937;
+  padding-top: 20px;
+}
+
+.ip-lookup-results-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 16px;
+}
+
+.ip-lookup-results-title {
+  font-family: monospace;
+  font-size: 1rem;
+  font-weight: 600;
+  color: #06b6d4;
+}
+
+.ip-lookup-clear {
+  background: none;
+  border: none;
+  color: #6b7280;
+  font-size: 0.75rem;
+  cursor: pointer;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+}
+
+.ip-lookup-clear:hover { color: #f1f5f9; }
+
+.ip-lookup-stats {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 12px;
+  margin-bottom: 20px;
+}
+
+.ip-lookup-stat {
+  background-color: #1f2937;
+  border: 1px solid #374151;
+  border-radius: 6px;
+  padding: 12px;
+}
+
+.ip-lookup-stat-label {
+  font-size: 0.7rem;
+  color: #6b7280;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  margin-bottom: 6px;
+}
+
+.ip-lookup-stat-value {
+  font-family: monospace;
+  font-size: 1.75rem;
+  font-weight: 700;
+  color: #f1f5f9;
+}
+
+.ip-lookup-details {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 20px;
+  margin-bottom: 20px;
+}
+
+.ip-lookup-detail-title {
+  font-size: 0.7rem;
+  color: #06b6d4;
+  text-transform: uppercase;
+  letter-spacing: 0.15em;
+  margin-bottom: 12px;
+}
+
+.ip-lookup-detail-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 6px 0;
+  border-bottom: 1px solid #1f2937;
+  font-size: 0.85rem;
+}
+
+.ip-lookup-detail-key { color: #6b7280; }
+.ip-lookup-detail-value { color: #f1f5f9; font-family: monospace; }
+
+.ip-lookup-reports { margin-top: 20px; }
+
+.ip-lookup-reports-title {
+  font-size: 0.7rem;
+  color: #06b6d4;
+  text-transform: uppercase;
+  letter-spacing: 0.15em;
+  margin-bottom: 12px;
+}
+
+.ip-lookup-report-list {
+  max-height: 260px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.ip-lookup-report-list::-webkit-scrollbar { width: 4px; }
+.ip-lookup-report-list::-webkit-scrollbar-track { background: #1f2937; }
+.ip-lookup-report-list::-webkit-scrollbar-thumb { background: #374151; border-radius: 2px; }
+
+.ip-lookup-report-item {
+  background-color: #1f2937;
+  border: 1px solid #374151;
+  border-radius: 6px;
+  padding: 10px 12px;
+}
+
+.ip-lookup-report-meta {
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+
+.ip-lookup-report-date { font-size: 0.7rem; color: #6b7280; font-family: monospace; }
+.ip-lookup-report-country { font-size: 0.7rem; color: #06b6d4; }
+.ip-lookup-report-comment { font-size: 0.8rem; color: #9ca3af; line-height: 1.4; }
+```
+
+### Step 7: Configure Apollo Client
+
+Create `frontend/app/services/apollo.js`:
+
+```javascript
+import Service from '@ember/service';
+import { ApolloClient, InMemoryCache, HttpLink } from '@apollo/client/core';
+import config from 'frontend/config/environment';
+
+export default class ApolloService extends Service {
+  client = new ApolloClient({
+    link: new HttpLink({
+      uri: config.apollo.apiURL,
+    }),
+    cache: new InMemoryCache(),
+  });
+
+  query(options) {
+    return this.client.query(options);
+  }
+
+  mutate(options) {
+    return this.client.mutate(options);
+  }
 }
 ```
 
-### Step 6: Configure Apollo Client
-
-Create `frontend/config/environment.js` and update:
+### Step 8: Update `frontend/config/environment.js`
 
 ```javascript
 'use strict';
@@ -617,30 +1071,21 @@ module.exports = function (environment) {
     environment,
     rootURL: '/',
     locationType: 'history',
-    
-    // Apollo Client Configuration
+
     apollo: {
-      apiURL: environment === 'production' 
-        ? 'https://your-backend-api.herokuapp.com/graphql'
+      apiURL: environment === 'production'
+        ? 'https://your-render-backend.onrender.com/graphql'
         : 'http://localhost:4000/graphql',
-      requestCredentials: 'same-origin'
+      requestCredentials: 'omit'
     },
 
     EmberENV: {
       EXTEND_PROTOTYPES: false,
-      FEATURES: {
-        // Enable features here
-      }
+      FEATURES: {}
     },
 
-    APP: {
-      // App-specific config
-    }
+    APP: {}
   };
-
-  if (environment === 'development') {
-    // Development-specific config
-  }
 
   if (environment === 'test') {
     ENV.locationType = 'none';
@@ -650,20 +1095,49 @@ module.exports = function (environment) {
     ENV.APP.autoboot = false;
   }
 
-  if (environment === 'production') {
-    // Production-specific config
-  }
-
   return ENV;
 };
 ```
 
-### Step 7: Create GraphQL Queries
+### Step 9: Update `frontend/app/app.js`
+
+```javascript
+import Application from '@ember/application';
+import compatModules from '@embroider/virtual/compat-modules';
+import Resolver from 'ember-resolver';
+import loadInitializers from 'ember-load-initializers';
+import config from 'frontend/config/environment';
+
+export default class App extends Application {
+  modulePrefix = config.modulePrefix;
+  Resolver = Resolver.withModules(compatModules);
+}
+
+loadInitializers(App, config.modulePrefix, compatModules);
+```
+
+### Step 10: Update `frontend/app/router.js`
+
+```javascript
+import EmberRouter from '@ember/routing/router';
+import config from 'frontend/config/environment';
+
+export default class Router extends EmberRouter {
+  location = config.locationType;
+  rootURL = config.rootURL;
+}
+
+Router.map(function () {
+  this.route('dashboard', { path: '/' });
+});
+```
+
+### Step 11: Create GraphQL Queries
 
 Create `frontend/app/gql/queries/threat-intelligence.js`:
 
 ```javascript
-import { gql } from 'graphql-tag';
+import { gql } from '@apollo/client/core';
 
 export default gql`
   query ThreatIntelligence($ipAddress: String!) {
@@ -697,7 +1171,7 @@ export default gql`
 Create `frontend/app/gql/queries/recent-threats.js`:
 
 ```javascript
-import { gql } from 'graphql-tag';
+import { gql } from '@apollo/client/core';
 
 export default gql`
   query RecentThreats($limit: Int, $minScore: Int) {
@@ -715,7 +1189,7 @@ export default gql`
 Create `frontend/app/gql/queries/threat-stats.js`:
 
 ```javascript
-import { gql } from 'graphql-tag';
+import { gql } from '@apollo/client/core';
 
 export default gql`
   query ThreatStats {
@@ -730,37 +1204,23 @@ export default gql`
 `;
 ```
 
-### Step 8: Create Application Route
+### Step 12: Create Routes
 
 Create `frontend/app/routes/application.js`:
 
 ```javascript
 import Route from '@ember/routing/route';
-import { inject as service } from '@ember/service';
 
-export default class ApplicationRoute extends Route {
-  @service apollo;
-
-  async beforeModel() {
-    // Initialize Apollo Client
-    try {
-      await this.apollo.client;
-    } catch (error) {
-      console.error('Failed to initialize Apollo Client:', error);
-    }
-  }
-}
+export default class ApplicationRoute extends Route {}
 ```
-
-### Step 9: Create Dashboard Route
 
 Create `frontend/app/routes/dashboard.js`:
 
 ```javascript
 import Route from '@ember/routing/route';
-import { inject as service } from '@ember/service';
-import threatStatsQuery from '../gql/queries/threat-stats';
-import recentThreatsQuery from '../gql/queries/recent-threats';
+import { service } from '@ember/service';
+import threatStats from 'frontend/gql/queries/threat-stats';
+import recentThreats from 'frontend/gql/queries/recent-threats';
 
 export default class DashboardRoute extends Route {
   @service apollo;
@@ -768,23 +1228,23 @@ export default class DashboardRoute extends Route {
   async model() {
     try {
       const [stats, threats] = await Promise.all([
-        this.apollo.query({ 
-          query: threatStatsQuery,
+        this.apollo.query({
+          query: threatStats,
           fetchPolicy: 'network-only'
         }),
-        this.apollo.query({ 
-          query: recentThreatsQuery,
-          variables: { limit: 20, minScore: 75 },
+        this.apollo.query({
+          query: recentThreats,
+          variables: { limit: 20, minScore: 0 },
           fetchPolicy: 'network-only'
-        })
+        }),
       ]);
 
       return {
-        stats: stats.threatStats,
-        threats: threats.recentThreats
+        stats: stats.data.threatStats,
+        threats: threats.data.recentThreats
       };
     } catch (error) {
-      console.error('Error loading dashboard data:', error);
+      console.error('Error fetching dashboard data:', error);
       return {
         stats: null,
         threats: [],
@@ -795,272 +1255,68 @@ export default class DashboardRoute extends Route {
 }
 ```
 
-### Step 10: Create IP Lookup Component
+### Step 13: Create Templates
 
-Create `frontend/app/components/ip-lookup.js`:
-
-```javascript
-import Component from '@glimmer/component';
-import { inject as service } from '@ember/service';
-import { tracked } from '@glimmer/tracking';
-import { action } from '@ember/object';
-import threatIntelligenceQuery from '../gql/queries/threat-intelligence';
-
-export default class IpLookupComponent extends Component {
-  @service apollo;
-  @tracked ipAddress = '';
-  @tracked threatData = null;
-  @tracked isLoading = false;
-  @tracked error = null;
-
-  @action
-  updateIpAddress(event) {
-    this.ipAddress = event.target.value;
-    this.error = null;
-  }
-
-  @action
-  async lookupIp(event) {
-    event.preventDefault();
-    
-    if (!this.ipAddress.trim()) {
-      this.error = 'Please enter an IP address';
-      return;
-    }
-
-    this.isLoading = true;
-    this.error = null;
-    this.threatData = null;
-
-    try {
-      const result = await this.apollo.query({
-        query: threatIntelligenceQuery,
-        variables: { ipAddress: this.ipAddress.trim() },
-        fetchPolicy: 'network-only'
-      });
-
-      this.threatData = result.threatIntelligence;
-    } catch (err) {
-      this.error = err.message || 'Failed to lookup IP address';
-      console.error('Lookup error:', err);
-    } finally {
-      this.isLoading = false;
-    }
-  }
-
-  @action
-  clearResults() {
-    this.threatData = null;
-    this.error = null;
-    this.ipAddress = '';
-  }
-
-  get threatLevel() {
-    if (!this.threatData) return null;
-    
-    const score = this.threatData.abuseScore;
-    if (score >= 75) return 'high';
-    if (score >= 50) return 'medium';
-    return 'low';
-  }
-
-  get threatLevelText() {
-    const level = this.threatLevel;
-    if (level === 'high') return 'High Risk';
-    if (level === 'medium') return 'Medium Risk';
-    return 'Low Risk';
-  }
-
-  get threatBadgeClass() {
-    const level = this.threatLevel;
-    return `threat-badge threat-${level}`;
-  }
-}
-```
-
-Create `frontend/app/components/ip-lookup.hbs`:
+Create `frontend/app/templates/application.hbs`:
 
 ```handlebars
-<div class="card max-w-4xl mx-auto">
-  <h2 class="text-2xl font-bold mb-6 text-gray-900 dark:text-white">
-    IP Threat Intelligence Lookup
-  </h2>
-
-  <form {{on "submit" this.lookupIp}} class="mb-6">
-    <div class="flex gap-4">
-      <div class="flex-1">
-        <label for="ip-input" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
-          Enter IP Address
-        </label>
-        <input
-          id="ip-input"
-          type="text"
-          value={{this.ipAddress}}
-          {{on "input" this.updateIpAddress}}
-          placeholder="e.g., 118.25.6.39"
-          class="input"
-          disabled={{this.isLoading}}
-          aria-label="IP Address Input"
-        />
+<div class="app-wrapper">
+  <nav class="app-nav">
+    <div class="app-nav-inner">
+      <div class="app-nav-brand">
+        <div class="app-nav-icon">⬡</div>
+        <span class="app-nav-title">Threat Tracker</span>
       </div>
-      <div class="flex items-end">
-        <button 
-          type="submit" 
-          class="btn btn-primary"
-          disabled={{this.isLoading}}
-          aria-label="Lookup IP Address"
-        >
-          {{#if this.isLoading}}
-            <span class="flex items-center gap-2">
-              <span class="spinner"></span>
-              Analyzing...
-            </span>
-          {{else}}
-            Lookup IP
-          {{/if}}
-        </button>
-      </div>
+      <div class="app-nav-subtitle">Powered by AbuseIPDB & GraphQL</div>
     </div>
-  </form>
+  </nav>
 
-  {{#if this.error}}
-    <div class="bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 text-red-800 dark:text-red-200 px-4 py-3 rounded-lg mb-6" role="alert">
-      <p class="font-semibold">Error</p>
-      <p>{{this.error}}</p>
+  <main class="app-main">
+    {{outlet}}
+  </main>
+
+  <footer class="app-footer">
+    <div class="app-footer-inner">
+      <p>Built with Ember.js, GraphQL, and CSS</p>
+      <p>Data provided by AbuseIPDB API</p>
     </div>
-  {{/if}}
-
-  {{#if this.threatData}}
-    <div class="space-y-6">
-      {{! Threat Overview }}
-      <div class="border-t border-gray-200 dark:border-gray-700 pt-6">
-        <div class="flex items-center justify-between mb-4">
-          <h3 class="text-xl font-semibold text-gray-900 dark:text-white">
-            Threat Analysis: {{this.threatData.ipAddress}}
-          </h3>
-          <button 
-            type="button"
-            {{on "click" this.clearResults}}
-            class="text-sm text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white"
-            aria-label="Clear Results"
-          >
-            Clear Results
-          </button>
-        </div>
-
-        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
-          <div class="bg-gray-50 dark:bg-gray-800 p-4 rounded-lg">
-            <p class="text-sm text-gray-600 dark:text-gray-400 mb-1">Abuse Score</p>
-            <div class="flex items-center gap-2">
-              <p class="text-3xl font-bold text-gray-900 dark:text-white">
-                {{this.threatData.abuseScore}}%
-              </p>
-              <span class={{this.threatBadgeClass}}>
-                {{this.threatLevelText}}
-              </span>
-            </div>
-          </div>
-
-          <div class="bg-gray-50 dark:bg-gray-800 p-4 rounded-lg">
-            <p class="text-sm text-gray-600 dark:text-gray-400 mb-1">Total Reports</p>
-            <p class="text-3xl font-bold text-gray-900 dark:text-white">
-              {{this.threatData.totalReports}}
-            </p>
-          </div>
-
-          <div class="bg-gray-50 dark:bg-gray-800 p-4 rounded-lg">
-            <p class="text-sm text-gray-600 dark:text-gray-400 mb-1">Country</p>
-            <p class="text-xl font-semibold text-gray-900 dark:text-white">
-              {{this.threatData.countryCode}}
-            </p>
-            <p class="text-sm text-gray-600 dark:text-gray-400">
-              {{this.threatData.location.country}}
-            </p>
-          </div>
-
-          <div class="bg-gray-50 dark:bg-gray-800 p-4 rounded-lg">
-            <p class="text-sm text-gray-600 dark:text-gray-400 mb-1">Whitelisted</p>
-            <p class="text-2xl font-bold {{if this.threatData.isWhitelisted 'text-green-600' 'text-red-600'}}">
-              {{if this.threatData.isWhitelisted "Yes" "No"}}
-            </p>
-          </div>
-        </div>
-
-        {{! Detailed Information }}
-        <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
-          <div>
-            <h4 class="font-semibold text-gray-900 dark:text-white mb-3">Network Information</h4>
-            <dl class="space-y-2">
-              <div class="flex justify-between">
-                <dt class="text-gray-600 dark:text-gray-400">ISP:</dt>
-                <dd class="font-medium text-gray-900 dark:text-white">{{this.threatData.isp}}</dd>
-              </div>
-              <div class="flex justify-between">
-                <dt class="text-gray-600 dark:text-gray-400">Usage Type:</dt>
-                <dd class="font-medium text-gray-900 dark:text-white">{{this.threatData.usageType}}</dd>
-              </div>
-              {{#if this.threatData.domain}}
-                <div class="flex justify-between">
-                  <dt class="text-gray-600 dark:text-gray-400">Domain:</dt>
-                  <dd class="font-medium text-gray-900 dark:text-white">{{this.threatData.domain}}</dd>
-                </div>
-              {{/if}}
-              {{#if this.threatData.location.city}}
-                <div class="flex justify-between">
-                  <dt class="text-gray-600 dark:text-gray-400">City:</dt>
-                  <dd class="font-medium text-gray-900 dark:text-white">{{this.threatData.location.city}}</dd>
-                </div>
-              {{/if}}
-            </dl>
-          </div>
-
-          <div>
-            <h4 class="font-semibold text-gray-900 dark:text-white mb-3">Timeline</h4>
-            <dl class="space-y-2">
-              {{#if this.threatData.lastReportedAt}}
-                <div class="flex justify-between">
-                  <dt class="text-gray-600 dark:text-gray-400">Last Reported:</dt>
-                  <dd class="font-medium text-gray-900 dark:text-white">
-                    {{this.threatData.lastReportedAt}}
-                  </dd>
-                </div>
-              {{/if}}
-            </dl>
-          </div>
-        </div>
-
-        {{! Recent Reports }}
-        {{#if this.threatData.reports}}
-          <div class="mt-6">
-            <h4 class="font-semibold text-gray-900 dark:text-white mb-3">Recent Abuse Reports</h4>
-            <div class="space-y-3 max-h-64 overflow-y-auto">
-              {{#each this.threatData.reports as |report|}}
-                <div class="bg-gray-50 dark:bg-gray-800 p-3 rounded-lg">
-                  <div class="flex justify-between items-start mb-2">
-                    <span class="text-xs text-gray-600 dark:text-gray-400">
-                      {{report.reportedAt}}
-                    </span>
-                    {{#if report.reporterCountryCode}}
-                      <span class="text-xs font-semibold text-gray-700 dark:text-gray-300">
-                        From: {{report.reporterCountryCode}}
-                      </span>
-                    {{/if}}
-                  </div>
-                  <p class="text-sm text-gray-700 dark:text-gray-300">
-                    {{report.comment}}
-                  </p>
-                </div>
-              {{/each}}
-            </div>
-          </div>
-        {{/if}}
-      </div>
-    </div>
-  {{/if}}
+  </footer>
 </div>
 ```
 
-### Step 11: Create Threat Stats Component
+Create `frontend/app/templates/dashboard.hbs`:
+
+```handlebars
+<div class="dashboard-wrapper">
+  <header class="dashboard-header">
+    <p class="dashboard-header-eyebrow">Live Intelligence Feed</p>
+    <h1 class="dashboard-header-title">
+      AbuseIPDB <span>Threat Tracker</span>
+    </h1>
+    <p class="dashboard-header-subtitle">
+      Real-time cybersecurity threat intelligence powered by GraphQL
+    </p>
+  </header>
+
+  {{#if @model.error}}
+    <div class="dashboard-error" role="alert">
+      <p class="dashboard-error-title">Error Loading Dashboard</p>
+      <p>{{@model.error}}</p>
+    </div>
+  {{/if}}
+
+  <div class="dashboard-grid">
+    <div><ThreatStats @stats={{@model.stats}} /></div>
+    <div><ThreatFeed @threats={{@model.threats}} /></div>
+  </div>
+
+  <div class="dashboard-lookup">
+    <IpLookup />
+  </div>
+</div>
+```
+
+### Step 14: Create Components
 
 Create `frontend/app/components/threat-stats.js`:
 
@@ -1083,45 +1339,35 @@ export default class ThreatStatsComponent extends Component {
 Create `frontend/app/components/threat-stats.hbs`:
 
 ```handlebars
-<div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4 mb-8">
-  <div class="card bg-blue-50 dark:bg-blue-900/20 border-l-4 border-blue-500">
-    <p class="text-sm text-blue-600 dark:text-blue-400 font-semibold mb-1">Total Threats</p>
-    <p class="text-3xl font-bold text-blue-900 dark:text-blue-100">
-      {{this.stats.totalThreatsTracked}}
-    </p>
+<div class="threat-stats">
+  <p class="threat-stats-title">Threat Statistics</p>
+
+  <div class="threat-stats-card threat-stats-card--cyan">
+    <p class="threat-stats-card-label">Total Tracked</p>
+    <p class="threat-stats-card-value">{{this.stats.totalThreatsTracked}}</p>
   </div>
 
-  <div class="card bg-red-50 dark:bg-red-900/20 border-l-4 border-red-500">
-    <p class="text-sm text-red-600 dark:text-red-400 font-semibold mb-1">High Risk</p>
-    <p class="text-3xl font-bold text-red-900 dark:text-red-100">
-      {{this.stats.highRiskThreats}}
-    </p>
+  <div class="threat-stats-card threat-stats-card--red">
+    <p class="threat-stats-card-label">High Risk</p>
+    <p class="threat-stats-card-value">{{this.stats.highRiskThreats}}</p>
   </div>
 
-  <div class="card bg-yellow-50 dark:bg-yellow-900/20 border-l-4 border-yellow-500">
-    <p class="text-sm text-yellow-600 dark:text-yellow-400 font-semibold mb-1">Medium Risk</p>
-    <p class="text-3xl font-bold text-yellow-900 dark:text-yellow-100">
-      {{this.stats.mediumRiskThreats}}
-    </p>
+  <div class="threat-stats-card threat-stats-card--yellow">
+    <p class="threat-stats-card-label">Medium Risk</p>
+    <p class="threat-stats-card-value">{{this.stats.mediumRiskThreats}}</p>
   </div>
 
-  <div class="card bg-green-50 dark:bg-green-900/20 border-l-4 border-green-500">
-    <p class="text-sm text-green-600 dark:text-green-400 font-semibold mb-1">Low Risk</p>
-    <p class="text-3xl font-bold text-green-900 dark:text-green-100">
-      {{this.stats.lowRiskThreats}}
-    </p>
+  <div class="threat-stats-card threat-stats-card--green">
+    <p class="threat-stats-card-label">Low Risk</p>
+    <p class="threat-stats-card-value">{{this.stats.lowRiskThreats}}</p>
   </div>
 
-  <div class="card bg-purple-50 dark:bg-purple-900/20 border-l-4 border-purple-500">
-    <p class="text-sm text-purple-600 dark:text-purple-400 font-semibold mb-1">Countries</p>
-    <p class="text-3xl font-bold text-purple-900 dark:text-purple-100">
-      {{this.stats.countriesAffected}}
-    </p>
+  <div class="threat-stats-card threat-stats-card--purple">
+    <p class="threat-stats-card-label">Countries</p>
+    <p class="threat-stats-card-value">{{this.stats.countriesAffected}}</p>
   </div>
 </div>
 ```
-
-### Step 12: Create Threat Feed Component
 
 Create `frontend/app/components/threat-feed.js`:
 
@@ -1143,8 +1389,7 @@ export default class ThreatFeedComponent extends Component {
 
   @action
   getThreatBadgeClass(score) {
-    const level = this.getThreatLevel(score);
-    return `threat-badge threat-${level}`;
+    return `threat-badge threat-${this.getThreatLevel(score)}`;
   }
 
   @action
@@ -1159,21 +1404,19 @@ export default class ThreatFeedComponent extends Component {
 Create `frontend/app/components/threat-feed.hbs`:
 
 ```handlebars
-<div class="card">
-  <h3 class="text-xl font-bold mb-4 text-gray-900 dark:text-white">
-    Recent Malicious IPs
-  </h3>
+<div class="threat-feed">
+  <h3 class="threat-feed-title">Recent Malicious IPs</h3>
 
   {{#if this.threats.length}}
-    <div class="space-y-2">
+    <div class="threat-feed-list">
       {{#each this.threats as |threat|}}
-        <div class="threat-item">
-          <div class="flex-1">
-            <div class="flex items-center gap-3">
+        <div class="threat-feed-item">
+          <div>
+            <div style="display: flex; align-items: center; gap: 12px;">
               <button
                 type="button"
                 {{on "click" (fn this.copyIpAddress threat.ipAddress)}}
-                class="font-mono font-semibold text-gray-900 dark:text-white hover:text-primary cursor-pointer"
+                class="threat-feed-ip"
                 title="Click to copy"
                 aria-label="Copy IP address {{threat.ipAddress}}"
               >
@@ -1183,565 +1426,316 @@ Create `frontend/app/components/threat-feed.hbs`:
                 {{threat.abuseScore}}%
               </span>
             </div>
-            <div class="flex gap-4 mt-1 text-sm text-gray-600 dark:text-gray-400">
+            <div class="threat-feed-meta">
               <span>{{threat.countryCode}}</span>
               <span>{{threat.totalReports}} reports</span>
             </div>
           </div>
-          <div class="text-xs text-gray-500 dark:text-gray-500">
-            {{threat.lastReportedAt}}
-          </div>
+          <div class="threat-feed-timestamp">{{threat.lastReportedAt}}</div>
         </div>
       {{/each}}
     </div>
   {{else}}
-    <p class="text-gray-600 dark:text-gray-400 text-center py-8">
-      No threats available. Try adjusting the minimum score filter.
-    </p>
+    <p class="threat-feed-empty">No threats yet. Look up an IP to populate the feed.</p>
   {{/if}}
 </div>
 ```
 
-### Step 13: Create Dashboard Template
-
-Create `frontend/app/templates/dashboard.hbs`:
-
-```handlebars
-<div class="container mx-auto px-4 py-8">
-  <header class="mb-8">
-    <h1 class="text-4xl font-bold text-gray-900 dark:text-white mb-2">
-      AbuseIPDB Threat Tracker
-    </h1>
-    <p class="text-gray-600 dark:text-gray-400">
-      Real-time cybersecurity threat intelligence powered by GraphQL
-    </p>
-  </header>
-
-  {{#if @model.error}}
-    <div class="bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 text-red-800 dark:text-red-200 px-6 py-4 rounded-lg mb-8" role="alert">
-      <p class="font-semibold">Error Loading Dashboard</p>
-      <p>{{@model.error}}</p>
-    </div>
-  {{/if}}
-
-  {{#if @model.stats}}
-    <ThreatStats @stats={{@model.stats}} />
-  {{/if}}
-
-  <div class="mb-8">
-    <IpLookup />
-  </div>
-
-  {{#if @model.threats}}
-    <ThreatFeed @threats={{@model.threats}} />
-  {{/if}}
-</div>
-```
-
-### Step 14: Update Application Template
-
-Update `frontend/app/templates/application.hbs`:
-
-```handlebars
-<div class="min-h-screen bg-gray-50 dark:bg-dark-bg">
-  <nav class="bg-white dark:bg-dark-card shadow-sm mb-8">
-    <div class="container mx-auto px-4 py-4">
-      <div class="flex items-center justify-between">
-        <div class="flex items-center gap-2">
-          <svg class="w-8 h-8 text-primary" fill="currentColor" viewBox="0 0 20 20">
-            <path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clip-rule="evenodd"></path>
-          </svg>
-          <span class="text-xl font-bold text-gray-900 dark:text-white">
-            Threat Tracker
-          </span>
-        </div>
-        <div class="text-sm text-gray-600 dark:text-gray-400">
-          Powered by AbuseIPDB & GraphQL
-        </div>
-      </div>
-    </div>
-  </nav>
-
-  <main>
-    {{outlet}}
-  </main>
-
-  <footer class="mt-16 py-8 border-t border-gray-200 dark:border-gray-700">
-    <div class="container mx-auto px-4 text-center text-sm text-gray-600 dark:text-gray-400">
-      <p>Built with Ember.js, GraphQL, and CSS</p>
-      <p class="mt-2">Data provided by AbuseIPDB API</p>
-    </div>
-  </footer>
-</div>
-```
-
-### Step 15: Update Router
-
-Update `frontend/app/router.js`:
+Create `frontend/app/components/ip-lookup.js`:
 
 ```javascript
-import EmberRouter from '@ember/routing/router';
-import config from 'frontend/config/environment';
+import Component from '@glimmer/component';
+import { service } from '@ember/service';
+import { tracked } from '@glimmer/tracking';
+import { action } from '@ember/object';
+import threatIntelligence from '../gql/queries/threat-intelligence';
 
-export default class Router extends EmberRouter {
-  location = config.locationType;
-  rootURL = config.rootURL;
+export default class IpLookupComponent extends Component {
+  @service apollo;
+  @service router;
+
+  @tracked ipAddress = '';
+  @tracked threatData = null;
+  @tracked isLoading = false;
+  @tracked error = null;
+
+  @action
+  updateIpAddress(event) {
+    this.ipAddress = event.target.value;
+    this.error = null;
+  }
+
+  @action
+  async lookupIp(event) {
+    event.preventDefault();
+
+    if (!this.ipAddress.trim()) {
+      this.error = 'Please enter an IP address';
+      return;
+    }
+
+    this.isLoading = true;
+    this.error = null;
+    this.threatData = null;
+
+    try {
+      const result = await this.apollo.query({
+        query: threatIntelligence,
+        variables: { ipAddress: this.ipAddress.trim() },
+        fetchPolicy: 'network-only'
+      });
+
+      this.threatData = result.data.threatIntelligence;
+
+      // Refresh dashboard route to update recentThreats feed
+      this.router.refresh('dashboard');
+
+    } catch (err) {
+      this.error = err.message || 'Failed to lookup IP address';
+      console.error('Lookup error:', err);
+    } finally {
+      this.isLoading = false;
+    }
+  }
+
+  @action
+  clearResults() {
+    this.threatData = null;
+    this.error = null;
+    this.ipAddress = '';
+  }
+
+  get threatLevel() {
+    if (!this.threatData) return null;
+    const score = this.threatData.abuseScore;
+    if (score >= 75) return 'high';
+    if (score >= 50) return 'medium';
+    return 'low';
+  }
+
+  get threatLevelText() {
+    const level = this.threatLevel;
+    if (level === 'high') return 'High Risk';
+    if (level === 'medium') return 'Medium Risk';
+    return 'Low Risk';
+  }
+
+  get threatBadgeClass() {
+    return `threat-badge threat-${this.threatLevel}`;
+  }
 }
-
-Router.map(function () {
-  this.route('dashboard', { path: '/' });
-});
 ```
 
-### Step 16: Create `.gitignore`
+Create `frontend/app/components/ip-lookup.hbs`:
 
-Create `frontend/.gitignore`:
+```handlebars
+<div class="ip-lookup">
+  <h2 class="ip-lookup-title">IP Threat Intelligence Lookup</h2>
 
-```
-# dependencies
-/node_modules
-/bower_components
+  <form {{on "submit" this.lookupIp}} class="ip-lookup-form">
+    <div class="ip-lookup-input-wrapper">
+      <label for="ip-input" class="ip-lookup-label">Enter IP Address</label>
+      <input
+        id="ip-input"
+        type="text"
+        value={{this.ipAddress}}
+        {{on "input" this.updateIpAddress}}
+        placeholder="e.g., 118.25.6.39"
+        class="ip-lookup-input"
+        disabled={{this.isLoading}}
+        aria-label="IP Address Input"
+      />
+    </div>
+    <button
+      type="submit"
+      class="ip-lookup-button"
+      disabled={{this.isLoading}}
+      aria-label="Lookup IP Address"
+    >
+      {{#if this.isLoading}}
+        <span class="spinner"></span> Analyzing...
+      {{else}}
+        Lookup IP
+      {{/if}}
+    </button>
+  </form>
 
-# testing
-/coverage
+  {{#if this.error}}
+    <div class="ip-lookup-error" role="alert">
+      <strong>Error:</strong> {{this.error}}
+    </div>
+  {{/if}}
 
-# production
-/dist
-/tmp
+  {{#if this.threatData}}
+    <div class="ip-lookup-results">
+      <div class="ip-lookup-results-header">
+        <span class="ip-lookup-results-title">{{this.threatData.ipAddress}}</span>
+        <button type="button" class="ip-lookup-clear" {{on "click" this.clearResults}}>
+          Clear
+        </button>
+      </div>
 
-# misc
-/.sass-cache
-/connect.lock
-/libpeerconnection.log
-npm-debug.log*
-testem.log
-.DS_Store
-.env
-.env.local
-.env.*.local
+      <div class="ip-lookup-stats">
+        <div class="ip-lookup-stat">
+          <p class="ip-lookup-stat-label">Abuse Score</p>
+          <p class="ip-lookup-stat-value">{{this.threatData.abuseScore}}%</p>
+          <span class={{this.threatBadgeClass}}>{{this.threatLevelText}}</span>
+        </div>
+        <div class="ip-lookup-stat">
+          <p class="ip-lookup-stat-label">Total Reports</p>
+          <p class="ip-lookup-stat-value">{{this.threatData.totalReports}}</p>
+        </div>
+        <div class="ip-lookup-stat">
+          <p class="ip-lookup-stat-label">Country</p>
+          <p class="ip-lookup-stat-value" style="font-size: 1.2rem;">{{this.threatData.countryCode}}</p>
+          <p style="font-size: 0.75rem; color: #6b7280;">{{this.threatData.location.country}}</p>
+        </div>
+        <div class="ip-lookup-stat">
+          <p class="ip-lookup-stat-label">Whitelisted</p>
+          <p class="ip-lookup-stat-value" style="font-size: 1.2rem; color: {{if this.threatData.isWhitelisted '#10b981' '#ef4444'}}">
+            {{if this.threatData.isWhitelisted "Yes" "No"}}
+          </p>
+        </div>
+      </div>
 
-# IDE
-/.idea
-/.vscode
-*.sublime-project
-*.sublime-workspace
-```
+      <div class="ip-lookup-details">
+        <div>
+          <p class="ip-lookup-detail-title">Network Information</p>
+          <div class="ip-lookup-detail-row">
+            <span class="ip-lookup-detail-key">ISP</span>
+            <span class="ip-lookup-detail-value">{{this.threatData.isp}}</span>
+          </div>
+          <div class="ip-lookup-detail-row">
+            <span class="ip-lookup-detail-key">Usage Type</span>
+            <span class="ip-lookup-detail-value">{{this.threatData.usageType}}</span>
+          </div>
+          {{#if this.threatData.domain}}
+            <div class="ip-lookup-detail-row">
+              <span class="ip-lookup-detail-key">Domain</span>
+              <span class="ip-lookup-detail-value">{{this.threatData.domain}}</span>
+            </div>
+          {{/if}}
+          {{#if this.threatData.location.city}}
+            <div class="ip-lookup-detail-row">
+              <span class="ip-lookup-detail-key">City</span>
+              <span class="ip-lookup-detail-value">{{this.threatData.location.city}}</span>
+            </div>
+          {{/if}}
+        </div>
+        <div>
+          <p class="ip-lookup-detail-title">Timeline</p>
+          {{#if this.threatData.lastReportedAt}}
+            <div class="ip-lookup-detail-row">
+              <span class="ip-lookup-detail-key">Last Reported</span>
+              <span class="ip-lookup-detail-value">{{this.threatData.lastReportedAt}}</span>
+            </div>
+          {{/if}}
+        </div>
+      </div>
 
----
-
-## Complete File Structure
-
-```
-abuseipdb-tracker/
-├── server/
-│   ├── index.js
-│   ├── package.json
-│   ├── .env
-│   ├── .gitignore
-│   └── README.md
-│
-├── frontend/
-│   ├── app/
-│   │   ├── components/
-│   │   │   ├── ip-lookup.js
-│   │   │   ├── ip-lookup.hbs
-│   │   │   ├── threat-stats.js
-│   │   │   ├── threat-stats.hbs
-│   │   │   ├── threat-feed.js
-│   │   │   └── threat-feed.hbs
-│   │   ├── gql/
-│   │   │   └── queries/
-│   │   │       ├── threat-intelligence.js
-│   │   │       ├── recent-threats.js
-│   │   │       └── threat-stats.js
-│   │   ├── routes/
-│   │   │   ├── application.js
-│   │   │   └── dashboard.js
-│   │   ├── styles/
-│   │   │   └── app.css
-│   │   ├── templates/
-│   │   │   ├── application.hbs
-│   │   │   └── dashboard.hbs
-│   │   ├── app.js
-│   │   └── router.js
-│   ├── config/
-│   │   └── environment.js
-│   ├── public/
-│   ├── tests/
-│   ├── ember-cli-build.js
-│   ├── tailwind.config.js
-│   ├── package.json
-│   ├── .gitignore
-│   └── README.md
-│
-├── README.md
-└── .gitignore
+      {{#if this.threatData.reports}}
+        <div class="ip-lookup-reports">
+          <p class="ip-lookup-reports-title">Recent Abuse Reports</p>
+          <div class="ip-lookup-report-list">
+            {{#each this.threatData.reports as |report|}}
+              <div class="ip-lookup-report-item">
+                <div class="ip-lookup-report-meta">
+                  <span class="ip-lookup-report-date">{{report.reportedAt}}</span>
+                  {{#if report.reporterCountryCode}}
+                    <span class="ip-lookup-report-country">{{report.reporterCountryCode}}</span>
+                  {{/if}}
+                </div>
+                <p class="ip-lookup-report-comment">{{report.comment}}</p>
+              </div>
+            {{/each}}
+          </div>
+        </div>
+      {{/if}}
+    </div>
+  {{/if}}
+</div>
 ```
 
 ---
 
 ## Running the Application
 
-### Development Mode
-
-**Terminal 1 - Backend:**
 ```bash
+# Terminal 1 - Backend
 cd server
 npm run dev
-# Server runs on http://localhost:4000
-```
+# Runs on http://localhost:4000
 
-**Terminal 2 - Frontend:**
-```bash
+# Terminal 2 - Frontend (run as Administrator on Windows for symlink support)
 cd frontend
-npm start
-# or
 ember serve
-# Frontend runs on http://localhost:4200
+# Runs on http://localhost:4200
 ```
-
-**Access:**
-- Frontend: http://localhost:4200
-- GraphQL Playground: http://localhost:4000/graphql
 
 ---
 
 ## Deployment Guide
 
-### Option 1: Railway (Backend) + Netlify (Frontend)
+### Backend → Render (free)
 
-#### Deploy Backend to Railway
+1. Go to **render.com** → New → Web Service
+2. Connect your GitHub repo, select the `server` folder as root directory
+3. Configure:
+   - **Build Command:** `npm install`
+   - **Start Command:** `node index.js`
+   - **Instance Type:** Free
+4. Add environment variables:
+   - `ABUSEIPDB_API_KEY` → your key
+   - `NODE_ENV` → `production`
+5. Deploy — you'll get a URL like `https://your-app.onrender.com`
+6. Update CORS in `server/index.js` with your Netlify URL once you have it
 
-1. **Create Railway Account**: https://railway.app
-2. **Create New Project**: Click "New Project" → "Deploy from GitHub repo"
-3. **Connect Repository**: 
-   ```bash
-   # Initialize git in server directory
-   cd server
-   git init
-   git add .
-   git commit -m "Initial commit"
-   git remote add origin YOUR_GITHUB_REPO_URL
-   git push -u origin main
-   ```
-4. **Configure Environment Variables in Railway**:
-   - `PORT`: 4000
-   - `ABUSEIPDB_API_KEY`: your_actual_api_key
-   - `NODE_ENV`: production
-5. **Deploy**: Railway will auto-deploy
-6. **Get Deployment URL**: Copy the Railway URL (e.g., `https://your-app.railway.app`)
+### Frontend → Netlify (free)
 
-#### Deploy Frontend to Netlify
-
-1. **Update API URL** in `frontend/config/environment.js`:
-   ```javascript
-   apollo: {
-     apiURL: 'https://your-app.railway.app/graphql'
-   }
-   ```
-
-2. **Build Production**:
-   ```bash
-   cd frontend
-   npm run build
-   ```
-
-3. **Deploy to Netlify**:
-   - Create account: https://netlify.com
-   - Drag and drop `/dist` folder to Netlify
-   - Or use Netlify CLI:
-   ```bash
-   npm install -g netlify-cli
-   netlify login
-   netlify deploy --prod --dir=dist
-   ```
-
-4. **Configure Redirects** - Create `frontend/public/_redirects`:
+1. Update `frontend/config/environment.js` production URL with your Render URL
+2. Add `frontend/public/_redirects`:
    ```
    /*    /index.html   200
    ```
-
-### Option 2: Heroku (Backend) + Vercel (Frontend)
-
-#### Deploy Backend to Heroku
-
-```bash
-cd server
-
-# Install Heroku CLI
-# Then login
-heroku login
-
-# Create app
-heroku create your-app-name
-
-# Set environment variables
-heroku config:set ABUSEIPDB_API_KEY=your_key
-heroku config:set NODE_ENV=production
-
-# Deploy
-git push heroku main
-
-# Open app
-heroku open
-```
-
-#### Deploy Frontend to Vercel
-
-```bash
-cd frontend
-
-# Install Vercel CLI
-npm i -g vercel
-
-# Deploy
-vercel --prod
-
-# Follow prompts
-```
-
-### Option 3: All-in-One Render Deployment
-
-1. **Create Render Account**: https://render.com
-2. **Create Web Service** for backend
-3. **Create Static Site** for frontend
-4. Configure environment variables
+3. Go to **netlify.com** → Add new site → Import from Git
+4. Configure:
+   - **Base directory:** `frontend`
+   - **Build command:** `npm run build`
+   - **Publish directory:** `frontend/dist`
 5. Deploy
 
 ---
 
-## Testing Guide
+## Common Issues & Fixes
 
-### Backend Testing
-
-Test queries in GraphQL Playground at `http://localhost:4000/graphql`:
-
-```graphql
-# Test 1: Check specific IP
-query TestIP {
-  threatIntelligence(ipAddress: "118.25.6.39") {
-    ipAddress
-    abuseScore
-    totalReports
-    countryCode
-    location {
-      country
-      city
-    }
-  }
-}
-
-# Test 2: Get recent threats
-query TestRecentThreats {
-  recentThreats(limit: 10, minScore: 80) {
-    ipAddress
-    abuseScore
-    countryCode
-  }
-}
-
-# Test 3: Get threat statistics
-query TestStats {
-  threatStats {
-    totalThreatsTracked
-    highRiskThreats
-    mediumRiskThreats
-  }
-}
-```
-
-### Frontend Testing
-
-1. **Manual Testing**:
-   - Open http://localhost:4200
-   - Test IP lookup with known malicious IP: `118.25.6.39`
-   - Verify threat feed displays
-   - Check responsive design (resize browser)
-   - Test dark mode (if implemented)
-
-2. **Accessibility Testing**:
-   - Navigate with keyboard only (Tab, Enter)
-   - Use screen reader
-   - Check ARIA labels
-
-3. **Performance Testing**:
-   - Open DevTools → Network tab
-   - Check GraphQL query count
-   - Verify caching works
+| Issue | Fix |
+|-------|-----|
+| `ember-apollo-client` template processor error | Don't use it — use `@apollo/client` directly |
+| Symlink permission error on Windows | Run terminal as Administrator or enable Developer Mode |
+| `@warp-drive` crash | Remove all `@warp-drive/*` packages if not using EmberData |
+| Apollo result not showing data | Use `result.data.threatIntelligence` not `result.threatIntelligence` |
+| AbuseIPDB blacklist 429 error | Free tier limited to 5/day — use in-memory store instead |
+| Geolocation 429 error | Switched from ipapi.co to ip-api.com (45 req/min, no daily limit) |
+| Tailwind classes not generating | Use `@source` directive in app.css or write plain CSS classes |
 
 ---
 
 ## Resume Bullets
 
-### For Your Resume (Tailored to CrowdStrike)
+1. **"Developed real-time cybersecurity threat monitoring dashboard using Ember.js 6 and GraphQL, integrating AbuseIPDB API to analyze IP reputation data with threat severity scoring"**
 
-**Project Description:**
-> AbuseIPDB Threat Tracker - Cybersecurity threat intelligence dashboard built with Ember.js and GraphQL
+2. **"Built custom Apollo Client service for Ember.js 6 + Embroider/Vite build pipeline, replacing incompatible addon with direct @apollo/client integration"**
 
-**Bullet Points:**
+3. **"Designed GraphQL schema and resolvers with in-memory caching to work within free API tier constraints, reducing redundant external API calls and improving performance"**
 
-1. **"Developed real-time cybersecurity threat monitoring dashboard using Ember.js and GraphQL, integrating AbuseIPDB API to analyze and visualize IP reputation data with threat severity scoring and geographic mapping"**
+4. **"Created accessible, responsive dark-themed UI with pure CSS and Tailwind CSS v4, achieving consistent cross-browser rendering without framework dependencies"**
 
-2. **"Implemented Apollo Client and Server for efficient GraphQL data fetching, reducing REST API calls by 70% through query consolidation and intelligent caching strategies"**
+5. **"Deployed full-stack application with Ember.js frontend on Netlify and Node.js/Apollo GraphQL backend on Render, configuring CORS and environment-based API routing"**
 
-3. **"Built accessible, responsive UI components following WCAG 2.1 guidelines with full keyboard navigation support, ARIA labels, and screen reader compatibility across all threat visualization features"**
-
-4. **"Designed GraphQL schema and resolvers to aggregate external threat intelligence APIs, providing unified data layer with field-level permissions and optimized query patterns for data-intensive security monitoring"**
-
-5. **"Created interactive data visualizations using Chart.js to display threat analytics, severity distributions, and geographic threat patterns, enabling security analysts to quickly identify and respond to emerging threats"**
-
-### Technical Skills to Add
-
-- **Frontend Frameworks**: Ember.js, Ember CLI, Glimmer Components
-- **API Technologies**: GraphQL, Apollo Client/Server, RESTful API Integration
-- **State Management**: Apollo Cache, GraphQL Query Optimization
-- **Styling**: Tailwind CSS, Responsive Design, Dark Mode
-- **Accessibility**: WCAG 2.1, ARIA, Keyboard Navigation, Screen Reader Support
-- **Data Visualization**: Chart.js, Interactive Dashboards
-- **Deployment**: Railway, Netlify, Vercel, Heroku
-- **Domain Knowledge**: Cybersecurity, Threat Intelligence, IP Reputation Analysis
-
----
-
-## Additional Features to Add (Week 2+)
-
-1. **Real-time Updates with GraphQL Subscriptions**
-2. **Export Reports to PDF**
-3. **Historical Threat Tracking**
-4. **Advanced Filtering and Search**
-5. **User Authentication**
-6. **Saved Searches/Watchlists**
-7. **Email Alerts for High-Risk IPs**
-8. **Integration with Additional Threat APIs** (VirusTotal, AlienVault)
-9. **Dark Mode Toggle**
-10. **Unit and Integration Tests**
-
----
-
-## Troubleshooting
-
-### Common Issues
-
-**Issue 1: CORS Error**
-```javascript
-// In server/index.js, update CORS config:
-app.use(cors({
-  origin: ['http://localhost:4200', 'http://localhost:7020'],
-  credentials: true
-}));
-```
-
-**Issue 2: API Rate Limit**
-- Free tier: 1,000 requests/day
-- Implement caching in resolvers
-- Add loading states
-
-**Issue 3: Ember Build Errors**
-```bash
-# Clear cache and reinstall
-rm -rf node_modules dist tmp
-npm install
-npm start
-```
-
-**Issue 4: GraphQL Query Errors**
-- Check API key is valid
-- Verify IP address format
-- Check network tab in DevTools
-
----
-
-## Resources
-
-### Documentation
-- Ember.js: https://emberjs.com/
-- Apollo GraphQL: https://www.apollographql.com/docs/
-- AbuseIPDB API: https://docs.abuseipdb.com/
-- Tailwind CSS: https://tailwindcss.com/docs
-
-### Community
-- Ember Discord: https://discord.gg/emberjs
-- GraphQL Discord: https://discord.graphql.org/
-- Stack Overflow: Use tags `emberjs`, `graphql`, `apollo`
-
----
-
-## Project Timeline
-
-### Week 1 Build Plan
-
-**Day 1**: Backend Setup
-- Set up Node.js server
-- Configure Apollo Server
-- Test AbuseIPDB API
-- Deploy backend
-
-**Day 2**: Ember Setup + GraphQL Integration
-- Create Ember app
-- Install ember-apollo-client
-- Configure Tailwind CSS
-- Create GraphQL queries
-
-**Day 3**: Core Features
-- IP lookup component
-- Threat intelligence display
-- Basic styling
-
-**Day 4**: Dashboard Features
-- Threat feed component
-- Statistics dashboard
-- Responsive design
-
-**Day 5**: Polish & Accessibility
-- Add ARIA labels
-- Keyboard navigation
-- Loading states
-- Error handling
-
-**Day 6**: Testing & Optimization
-- Manual testing
-- Performance optimization
-- Cross-browser testing
-
-**Day 7**: Deployment & Documentation
-- Deploy to production
-- Write README
-- Take screenshots
-- LinkedIn post
-
----
-
-## Contact & Support
-
-For issues or questions:
-1. Check GraphQL Playground for API errors
-2. Review browser console for frontend errors
-3. Check Network tab for failed requests
-4. Verify environment variables are set
-
----
-
-## License
-
-MIT License - Feel free to use this project in your portfolio
-
----
-
-## Acknowledgments
-
-- **AbuseIPDB** for threat intelligence API
-- **Anthropic Claude** for development assistance
-- **Ember.js Community** for framework support
-- **Apollo GraphQL** for excellent tooling
-
----
-
-**Good luck with your application to CrowdStrike! 🚀**
-
-This project showcases exactly the skills they're looking for:
-✅ Ember.js expertise
-✅ GraphQL proficiency
-✅ Data visualization
-✅ Cybersecurity domain knowledge
-✅ Accessibility focus
-✅ Production-ready code quality
+### Technical Skills
+- **Frontend:** Ember.js 6, Glimmer Components, Embroider, Vite
+- **API:** GraphQL, Apollo Client/Server v4, RESTful API Integration
+- **Styling:** Tailwind CSS v4, Pure CSS, Responsive Design
+- **Backend:** Node.js, Express, Apollo Server v4
+- **Deployment:** Netlify, Render
+- **Domain:** Cybersecurity, Threat Intelligence, IP Reputation Analysis
